@@ -241,12 +241,22 @@ static void uv__process_close_stream(uv_stdio_container_t* container) {
 }
 
 
-static void uv__write_int(int fd, int val) {
+static void uv__write_int(
+#ifdef __linux__
+                            volatile int* fd,
+#else
+                            int fd,
+#endif
+                            int val) {
+#ifdef __linux__
+  *fd = val;
+#else
   ssize_t n;
 
   do
     n = write(fd, &val, sizeof(val));
   while (n == -1 && errno == EINTR);
+#endif
 
   /* The write might have failed (e.g. if the parent process has died),
    * but we have nothing left but to _exit ourself now too. */
@@ -254,20 +264,32 @@ static void uv__write_int(int fd, int val) {
 }
 
 
-static void uv__write_errno(int error_fd) {
+static void uv__write_errno(
+#ifdef __linux__
+                            volatile int* error_fd
+#else
+                            int error_fd
+#endif
+                            ) {
   uv__write_int(error_fd, UV__ERR(errno));
 }
 
 
 #if !(defined(__APPLE__) && (TARGET_OS_TV || TARGET_OS_WATCH))
-/* execvp is marked __WATCHOS_PROHIBITED __TVOS_PROHIBITED, so must be
+/* May share the parent's memory space. Do not alter global state.
+ *
+ * execvp is marked __WATCHOS_PROHIBITED __TVOS_PROHIBITED, so must be
  * avoided. Since this isn't called on those targets, the function
  * doesn't even need to be defined for them.
  */
 static void uv__process_child_init(const uv_process_options_t* options,
+#ifdef __linux__
+                                   volatile int* error_fd,
+#else
+                                   int error_fd,
+#endif
                                    int stdio_count,
-                                   int (*pipes)[2],
-                                   int error_fd) {
+                                   int (*pipes)[2]) {
   sigset_t signewset;
   int close_fd;
   int use_fd;
@@ -397,6 +419,7 @@ static void uv__process_child_init(const uv_process_options_t* options,
     }
 
 #if defined(__linux__)
+    /* Avoid using pthread calls when using vfork. */
     n = sched_setaffinity(0, sizeof(cpuset), &cpuset);
     if (n)
       uv__write_int(error_fd, UV__ERR(n));
@@ -407,18 +430,27 @@ static void uv__process_child_init(const uv_process_options_t* options,
   }
 #endif
 
-  if (options->env != NULL)
-    environ = options->env;
-
   /* Reset signal mask just before exec. */
   sigemptyset(&signewset);
   if (sigprocmask(SIG_SETMASK, &signewset, NULL) != 0)
     abort();
 
+#ifdef __linux__
+  if (options->env != NULL) {
+    execvpe(options->file, options->args, options->env);
+  } else {
+    execvp(options->file, options->args);
+  }
+#else
+  if (options->env != NULL) {
+    environ = options->env;
+  }
+
 #ifdef __MVS__
   execvpe(options->file, options->args, environ);
 #else
   execvp(options->file, options->args);
+#endif
 #endif
 
   uv__write_errno(error_fd);
@@ -833,9 +865,13 @@ error:
 #endif
 
 static int uv__spawn_and_init_child_fork(const uv_process_options_t* options,
+#ifdef __linux__
+                                         volatile int* error_fd,
+#else
+                                         int error_fd,
+#endif
                                          int stdio_count,
                                          int (*pipes)[2],
-                                         int error_fd,
                                          pid_t* pid) {
   sigset_t signewset;
   sigset_t sigoldset;
@@ -854,11 +890,17 @@ static int uv__spawn_and_init_child_fork(const uv_process_options_t* options,
   if (pthread_sigmask(SIG_BLOCK, &signewset, &sigoldset) != 0)
     abort();
 
+#ifdef __linux__
+  *pid = vfork();
+#else
   *pid = fork();
+#endif
 
   if (*pid == 0) {
     /* Fork succeeded, in the child process */
-    uv__process_child_init(options, stdio_count, pipes, error_fd);
+    /* After vfork, this shares memory (notably stack) with the parent. The
+     * parent is paused until we exec or _exit. */
+    uv__process_child_init(options, error_fd, stdio_count, pipes);
     abort();
   }
 
@@ -879,11 +921,16 @@ static int uv__spawn_and_init_child(
     int stdio_count,
     int (*pipes)[2],
     pid_t* pid) {
-  int signal_pipe[2] = { -1, -1 };
-  int status;
   int err;
+  int status;
+#ifdef __linux__
+  volatile int exec_errorno;
+  int cancelstate;
+#else
+  int signal_pipe[2] = { -1, -1 };
   int exec_errorno;
   ssize_t r;
+#endif
 
 #if defined(__APPLE__)
   uv_once(&posix_spawn_init_once, uv__spawn_init_posix_spawn);
@@ -909,25 +956,51 @@ static int uv__spawn_and_init_child(
 
   /* The posix_spawn flow will return UV_ENOSYS if any of the posix_spawn_x_np
    * non-standard functions is both _needed_ and _undefined_. In those cases,
-   * default back to the fork/execve strategy. For all other errors, just fail. */
+   * default back to the fork/execvp strategy. For all other errors, just fail. */
   if (err != UV_ENOSYS)
     return err;
 
 #endif
 
+#ifdef __linux__
+  /* Acquire write lock to prevent opening new fds in worker threads */
+  uv_rwlock_wrlock(&loop->cloexec_lock);
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancelstate);
+
+  exec_errorno = 0;
+  err = uv__spawn_and_init_child_fork(options, &exec_errorno, stdio_count, pipes, pid);
+
+  /* Release lock in parent process */
+  pthread_setcancelstate(cancelstate, NULL);
+  uv_rwlock_wrunlock(&loop->cloexec_lock);
+
+  if (err == 0) {
+    if (exec_errorno == 0)
+      ; /* okay, execv (or abort) */
+    else {
+      /* got errorno from child (and _exit 127) */
+      do
+        err = waitpid(*pid, &status, 0);
+      while (err == -1 && errno == EINTR);
+      assert(err == *pid);
+      err = exec_errorno;
+    }
+  }
+
+#else /* !__linux__ */
   /* This pipe is used by the parent to wait until
-   * the child has called `execve()`. We need this
+   * the child has called `execvp()`. We need this
    * to avoid the following race condition:
    *
    *    if ((pid = fork()) > 0) {
    *      kill(pid, SIGTERM);
    *    }
    *    else if (pid == 0) {
-   *      execve("/bin/cat", argp, envp);
+   *      execvp("/bin/cat", argp);
    *    }
    *
    * The parent sends a signal immediately after forking.
-   * Since the child may not have called `execve()` yet,
+   * Since the child may not have called `execvp()` yet,
    * there is no telling what process receives the signal,
    * our fork or /bin/cat.
    *
@@ -942,7 +1015,7 @@ static int uv__spawn_and_init_child(
   /* Acquire write lock to prevent opening new fds in worker threads */
   uv_rwlock_wrlock(&loop->cloexec_lock);
 
-  err = uv__spawn_and_init_child_fork(options, stdio_count, pipes, signal_pipe[1], pid);
+  err = uv__spawn_and_init_child_fork(options, signal_pipe[1], stdio_count, pipes, pid);
 
   /* Release lock in parent process */
   uv_rwlock_wrunlock(&loop->cloexec_lock);
@@ -974,6 +1047,7 @@ static int uv__spawn_and_init_child(
   }
 
   uv__close_nocheckstdio(signal_pipe[0]);
+#endif
 
   return err;
 }
@@ -993,8 +1067,8 @@ int uv_spawn(uv_loop_t* loop,
   int (*pipes)[2];
   int stdio_count;
   pid_t pid;
-  int err;
   int exec_errorno;
+  int err;
   int i;
 
   uv__handle_init(loop, (uv_handle_t*)process, UV_PROCESS);
