@@ -35,10 +35,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
+#include <paths.h>
 
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
 # include <spawn.h>
-# include <paths.h>
 # include <sys/kauth.h>
 # include <sys/types.h>
 # include <sys/sysctl.h>
@@ -241,6 +241,119 @@ static void uv__process_close_stream(uv_stdio_container_t* container) {
 }
 
 
+static const char* uv__spawn_find_path_in_env(char* const* env) {
+  char* const* env_iterator;
+  const char path_var[] = "PATH=";
+
+  /* Look for an environment variable called PATH in the
+   * provided env array, and return its value if found */
+  for (env_iterator = env; *env_iterator != NULL; env_iterator++) {
+    if (strncmp(*env_iterator, path_var, sizeof(path_var) - 1) == 0) {
+      /* Found "PATH=" at the beginning of the string */
+      return *env_iterator + sizeof(path_var) - 1;
+    }
+  }
+
+  return NULL;
+}
+
+
+static int uv__execvpe(const char *file, char *const argv[], char *const envp[]) {
+  const char *p;
+  const char *z;
+  const char *path;
+  size_t l;
+  size_t k;
+  int err;
+  int seen_eacces;
+
+  /* Short circuit for erroneous case */
+  if (file == NULL)
+    return ENOENT;
+
+  /* If file contains a slash, execve/execvpe behave the same, and don't
+   * involve PATH resolution at all. Otherwise, if file does not include a
+   * slash, but no custom environment is to be used, the environment used for
+   * path resolution as well for the child process is that of the parent
+   * process, so execvpe is the way to go. */
+  if (strchr(file, '/') != NULL)
+    return execve(file, argv, envp);
+#ifdef __GLIBC_PREREQ
+# if (__GLIBC_PREREQ(2,11))
+  /* Old glibc did not have execvpe at all, so we always emulate it. */
+  if (envp == environ)
+    return execvpe(file, argv, envp);
+#endif
+#else
+  /* Assume all other environments have execvpe. */
+  if (envp == environ)
+    return execvpe(file, argv, envp);
+#endif
+
+  /* Look for the definition of PATH in the provided env */
+  path = uv__spawn_find_path_in_env(envp);
+
+  /* The following resolution logic (execvpe emulation) is copied from
+   * https://git.musl-libc.org/cgit/musl/tree/src/process/execvp.c
+   * and adapted to work for our specific usage */
+
+  /* If no path was provided in env, use the default value
+   * to look for the executable */
+  if (path == NULL)
+    path = _PATH_DEFPATH;
+
+  k = strnlen(file, NAME_MAX + 1);
+  if (k > NAME_MAX)
+    return ENAMETOOLONG;
+
+  err = ENOENT;
+  seen_eacces = 0;
+  l = strnlen(path, PATH_MAX - 1) + 1;
+
+  for (p = path;; p = z) {
+    /* Compose the new process file from the entry in the PATH
+     * environment variable and the actual file name */
+    char b[PATH_MAX + NAME_MAX];
+    z = strchr(p, ':');
+    if (!z)
+      z = p + strlen(p);
+    if ((size_t)(z - p) >= l) {
+      if (!*z++)
+        break;
+
+      continue;
+    }
+    memcpy(b, p, z - p);
+    b[z - p] = '/';
+    memcpy(b + (z - p) + (z > p), file, k + 1);
+
+    /* Try to spawn the new process file. If it fails with ENOENT, the
+     * new process file is not in this PATH entry, continue with the next
+     * PATH entry. */
+    execve(b, argv, envp);
+    err = errno;
+
+    switch (err) {
+    case EACCES:
+      seen_eacces = 1;
+      break; /* continue search */
+    case ENOENT:
+    case ENOTDIR:
+      break; /* continue search */
+    default:
+      return err;
+    }
+
+    if (!*z++)
+      break;
+  }
+
+  if (seen_eacces)
+    return EACCES;
+  return err;
+}
+
+
 static void uv__write_int(
 #ifdef __linux__
                             volatile int* fd,
@@ -437,7 +550,7 @@ static void uv__process_child_init(const uv_process_options_t* options,
 
 #ifdef __linux__
   if (options->env != NULL) {
-    execvpe(options->file, options->args, options->env);
+    uv__execvpe(options->file, options->args, options->env);
   } else {
     execvp(options->file, options->args);
   }
@@ -704,22 +817,6 @@ error:
   return err;
 }
 
-char* uv__spawn_find_path_in_env(char** env) {
-  char** env_iterator;
-  const char path_var[] = "PATH=";
-
-  /* Look for an environment variable called PATH in the
-   * provided env array, and return its value if found */
-  for (env_iterator = env; *env_iterator != NULL; env_iterator++) {
-    if (strncmp(*env_iterator, path_var, sizeof(path_var) - 1) == 0) {
-      /* Found "PATH=" at the beginning of the string */
-      return *env_iterator + sizeof(path_var) - 1;
-    }
-  }
-
-  return NULL;
-}
-
 
 static int uv__spawn_resolve_and_spawn(const uv_process_options_t* options,
                                        posix_spawnattr_t* attrs,
@@ -732,10 +829,6 @@ static int uv__spawn_resolve_and_spawn(const uv_process_options_t* options,
   size_t k;
   int err;
   int seen_eacces;
-
-  path = NULL;
-  err = -1;
-  seen_eacces = 0;
 
   /* Short circuit for erroneous case */
   if (options->file == NULL)
@@ -776,6 +869,8 @@ static int uv__spawn_resolve_and_spawn(const uv_process_options_t* options,
   if (k > NAME_MAX)
     return ENAMETOOLONG;
 
+  err = ENOENT;
+  seen_eacces = 0;
   l = strnlen(path, PATH_MAX - 1) + 1;
 
   for (p = path;; p = z) {
