@@ -863,15 +863,3 @@ update_timeout:
     timeout = real_timeout;
   }
 }
-
-
-int uv__io_fork(uv_loop_t* loop) {
-  /*
-    Nullify the msg queue but don't close it because
-    it is still being used by the parent.
-  */
-  loop->ep = NULL;
-
-  uv__platform_loop_delete(loop);
-  return uv__platform_loop_init(loop);
-}

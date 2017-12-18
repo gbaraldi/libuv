@@ -59,38 +59,6 @@ int uv__kqueue_init(uv_loop_t* loop) {
 }
 
 
-#if defined(__APPLE__) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
-static int uv__has_forked_with_cfrunloop;
-#endif
-
-int uv__io_fork(uv_loop_t* loop) {
-  int err;
-  loop->backend_fd = -1;
-  err = uv__kqueue_init(loop);
-  if (err)
-    return err;
-
-#if defined(__APPLE__) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
-  if (loop->cf_state != NULL) {
-    /* We cannot start another CFRunloop and/or thread in the child
-       process; CF aborts if you try or if you try to touch the thread
-       at all to kill it. So the best we can do is ignore it from now
-       on. This means we can't watch directories in the same way
-       anymore (like other BSDs). It also means we cannot properly
-       clean up the allocated resources; calling
-       uv__fsevents_loop_delete from uv_loop_close will crash the
-       process. So we sidestep the issue by pretending like we never
-       started it in the first place.
-    */
-    uv__store_relaxed(&uv__has_forked_with_cfrunloop, 1);
-    uv__free(loop->cf_state);
-    loop->cf_state = NULL;
-  }
-#endif /* #if defined(__APPLE__) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070 */
-  return err;
-}
-
-
 int uv__io_check_fd(uv_loop_t* loop, int fd) {
   struct kevent ev;
   int rc;
@@ -547,7 +515,7 @@ int uv_fs_event_start(uv_fs_event_t* handle,
   if (!(statbuf.st_mode & S_IFDIR))
     goto fallback;
 
-  if (0 == uv__load_relaxed(&uv__has_forked_with_cfrunloop)) {
+  {
     int r;
     /* The fallback fd is no longer needed */
     uv__close_nocheckstdio(fd);
@@ -582,10 +550,12 @@ int uv_fs_event_stop(uv_fs_event_t* handle) {
   uv__handle_stop(handle);
 
 #if defined(__APPLE__) && MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
-  if (0 == uv__load_relaxed(&uv__has_forked_with_cfrunloop))
-    if (handle->cf_cb != NULL)
-      r = uv__fsevents_close(handle);
+  if (handle->cf_cb != NULL)
+    r = uv__fsevents_close(handle);
 #endif
+
+  uv__free(handle->path);
+  handle->path = NULL;
 
   if (handle->event_watcher.fd != -1) {
     uv__io_close(handle->loop, &handle->event_watcher);
