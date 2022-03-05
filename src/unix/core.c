@@ -40,13 +40,13 @@
 #include <sys/uio.h> /* writev */
 #include <sys/resource.h> /* getrusage */
 #include <pwd.h>
+#include <grp.h>
 #include <sched.h>
 #include <sys/utsname.h>
 #include <sys/time.h>
 
 #ifdef __sun
 # include <sys/filio.h>
-# include <sys/types.h>
 # include <sys/wait.h>
 #endif
 
@@ -87,7 +87,6 @@ extern char** environ;
 #endif
 
 #if defined(__linux__)
-# include <sched.h>
 # include <sys/syscall.h>
 # define uv__accept4 accept4
 #endif
@@ -1073,8 +1072,8 @@ int uv_os_homedir(char* buffer, size_t* size) {
   if (r != UV_ENOENT)
     return r;
 
-  /* HOME is not set, so call uv__getpwuid_r() */
-  r = uv__getpwuid_r(&pwd);
+  /* HOME is not set, so call uv_os_get_passwd() */
+  r = uv_os_get_passwd(&pwd);
 
   if (r != 0) {
     return r;
@@ -1147,11 +1146,10 @@ return_buffer:
 }
 
 
-int uv__getpwuid_r(uv_passwd_t* pwd) {
+static int uv__getpwuid_r(uv_passwd_t *pwd, uid_t uid) {
   struct passwd pw;
   struct passwd* result;
   char* buf;
-  uid_t uid;
   size_t bufsize;
   size_t name_size;
   size_t homedir_size;
@@ -1170,7 +1168,6 @@ int uv__getpwuid_r(uv_passwd_t* pwd) {
   else
     bufsize = (size_t) initsize;
 
-  uid = geteuid();
   buf = NULL;
 
   for (;;) {
@@ -1257,25 +1254,103 @@ int uv__getpwuid_r(uv_passwd_t* pwd) {
 }
 
 
-void uv_os_free_passwd(uv_passwd_t* pwd) {
-  if (pwd == NULL)
-    return;
+int uv_os_get_group(uv_group_t* grp, uv_uid_t gid) {
+  struct group gp;
+  struct group* result;
+  char* buf;
+  char* gr_mem;
+  size_t bufsize;
+  size_t name_size;
+  long members;
+  size_t mem_size;
+  long initsize;
+  int r;
 
-  /*
-    The memory for name, shell, homedir, and gecos are allocated in a single
-    uv__malloc() call. The base of the pointer is stored in pwd->username, so
-    that is the field that needs to be freed.
-  */
-  uv__free(pwd->username);
-  pwd->username = NULL;
-  pwd->shell = NULL;
-  pwd->homedir = NULL;
-  pwd->gecos = NULL;
+  if (grp == NULL)
+    return UV_EINVAL;
+
+  initsize = sysconf(_SC_GETGR_R_SIZE_MAX);
+
+  if (initsize <= 0)
+    bufsize = 4096;
+  else
+    bufsize = (size_t) initsize;
+
+  buf = NULL;
+
+  for (;;) {
+    uv__free(buf);
+    buf = uv__malloc(bufsize);
+
+    if (buf == NULL)
+      return UV_ENOMEM;
+
+    do
+      r = getgrgid_r(gid, &gp, buf, bufsize, &result);
+    while (r == EINTR);
+
+    if (r != ERANGE)
+      break;
+
+    bufsize *= 2;
+  }
+
+  if (r != 0) {
+    uv__free(buf);
+    return UV__ERR(r);
+  }
+
+  if (result == NULL) {
+    uv__free(buf);
+    return UV_ENOENT;
+  }
+
+  /* Allocate memory for the groupname and members. */
+  name_size = strlen(gp.gr_name) + 1;
+  members = 0;
+  mem_size = sizeof(char*);
+  for (r = 0; gp.gr_mem[r] != NULL; r++) {
+    mem_size += strlen(gp.gr_mem[r]) + 1 + sizeof(char*);
+    members++;
+  }
+
+  gr_mem = uv__malloc(name_size + mem_size);
+  if (gr_mem == NULL) {
+    uv__free(buf);
+    return UV_ENOMEM;
+  }
+
+  /* Copy the members */
+  grp->members = (char**) gr_mem;
+  grp->members[members] = NULL;
+  gr_mem = (char*) ((char**) gr_mem + members + 1);
+  for (r = 0; r < members; r++) {
+    grp->members[r] = gr_mem;
+    gr_mem = stpcpy(gr_mem, gp.gr_mem[r]) + 1;
+  }
+  assert(gr_mem == (char*)grp->members + mem_size);
+
+  /* Copy the groupname */
+  grp->groupname = gr_mem;
+  memcpy(grp->groupname, gp.gr_name, name_size);
+  gr_mem += name_size;
+
+  /* Copy the gid */
+  grp->gid = gp.gr_gid;
+
+  uv__free(buf);
+
+  return 0;
 }
 
 
 int uv_os_get_passwd(uv_passwd_t* pwd) {
-  return uv__getpwuid_r(pwd);
+  return uv__getpwuid_r(pwd, geteuid());
+}
+
+
+int uv_os_get_passwd2(uv_passwd_t* pwd, uv_uid_t uid) {
+  return uv__getpwuid_r(pwd, uid);
 }
 
 
