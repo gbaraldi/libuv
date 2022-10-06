@@ -378,6 +378,6 @@ struct uv__loop_internal_fields_s {
 # define _COMPILER_MSAN_ENABLED_
 #endif
 #endif
-void uv__msan_unpoison(const volatile void *a, size_t size);
+static inline void uv__msan_unpoison(const volatile void *a, size_t size);
 
 #endif /* UV_COMMON_H_ */
