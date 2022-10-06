@@ -1598,7 +1598,6 @@ static int uv__fs_statx(int fd,
     flags |= AT_SYMLINK_NOFOLLOW;
 
   rc = uv__statx(dirfd, path, flags, mode, &statxbuf);
-  uv__msan_unpoison(&statxbuf, sizeof(struct uv__statx));
   
   switch (rc) {
   case 0:
