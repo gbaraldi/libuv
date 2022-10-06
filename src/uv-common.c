@@ -1003,9 +1003,3 @@ uint64_t uv_metrics_idle_time(uv_loop_t* loop) {
   return idle_time;
 }
 
-void uv__msan_unpoison(const volatile void *a, size_t size) {
-  #ifdef _COMPILER_MSAN_ENABLED_
-  __msan_unpoison(a, size);
-  // printf("unpoisoned\n");
-  #endif // _COMPILER_MSAN_ENABLED_
-}
