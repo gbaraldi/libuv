@@ -1598,7 +1598,7 @@ static int uv__fs_statx(int fd,
     flags |= AT_SYMLINK_NOFOLLOW;
 
   rc = uv__statx(dirfd, path, flags, mode, &statxbuf);
-  
+
   switch (rc) {
   case 0:
     break;
