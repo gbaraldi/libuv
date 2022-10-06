@@ -373,16 +373,13 @@ struct uv__loop_internal_fields_s {
   uv__loop_metrics_t loop_metrics;
 };
 
-#if defined(__has_feature) // Clang flavor
-#if __has_feature(memory_sanitizer)
-# define _COMPILER_MSAN_ENABLED_
-#endif
-#endif
 
 static inline void uv__msan_unpoison(const volatile void *a, size_t size) {
-  #ifdef _COMPILER_MSAN_ENABLED_
+#if defined(__has_feature) // Clang flavor
+# if __has_feature(memory_sanitizer)
   __msan_unpoison(a, size);
-  #endif // _COMPILER_MSAN_ENABLED_
+# endif
+#endif
 }
 
 #endif /* UV_COMMON_H_ */
