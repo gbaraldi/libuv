@@ -250,9 +250,7 @@ int uv__statx(int dirfd,
 #if !defined(__NR_statx) || defined(__ANDROID_API__) && __ANDROID_API__ < 30
   return errno = ENOSYS, -1;
 #else
-  int ret = syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
-  uv__msan_unpoison(&statxbuf, sizeof(struct uv__statx));
-  return ret;
+  return syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
 #endif
 }
 

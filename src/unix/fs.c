@@ -1619,7 +1619,8 @@ static int uv__fs_statx(int fd,
     uv__store_relaxed(&no_statx, 1);
     return UV_ENOSYS;
   }
-
+  uv__msan_unpoison(&statxbuf, sizeof(struct uv__statx));
+  
   buf->st_dev = makedev(statxbuf.stx_dev_major, statxbuf.stx_dev_minor);
   buf->st_mode = statxbuf.stx_mode;
   buf->st_nlink = statxbuf.stx_nlink;
