@@ -317,7 +317,7 @@ static void chown_root_cb(uv_fs_t* req) {
     ASSERT(req->result == UV_EINVAL);
 #   elif defined(__PASE__)
     /* On IBMi PASE, there is no root user. uid 0 is user qsecofr.
-     * User may grant qsecofr's privileges, including changing 
+     * User may grant qsecofr's privileges, including changing
      * the file's ownership to uid 0.
      */
     ASSERT(req->result == 0 || req->result == UV_EPERM);
@@ -3725,7 +3725,7 @@ static void fs_write_alotof_bufs_with_offset(int add_flags) {
   uv_fs_req_cleanup(&write_req);
 
   /* Read the strings back to separate buffers. */
-  buffer = malloc(sizeof(test_buf) * iovcount);
+  buffer = calloc(sizeof(test_buf), iovcount);
   ASSERT_NOT_NULL(buffer);
 
   for (index = 0; index < iovcount; ++index)
@@ -3931,9 +3931,9 @@ static void test_fs_partial(int doread) {
   ctx.doread = doread;
   ctx.interval = 1000;
   ctx.size = sizeof(test_buf) * iovcount;
-  ctx.data = malloc(ctx.size);
+  ctx.data = calloc(ctx.size,1);
   ASSERT_NOT_NULL(ctx.data);
-  buffer = malloc(ctx.size);
+  buffer = calloc(ctx.size,1);
   ASSERT_NOT_NULL(buffer);
 
   for (index = 0; index < iovcount; ++index)

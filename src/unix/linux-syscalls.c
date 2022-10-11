@@ -26,6 +26,51 @@
 #include <sys/types.h>
 #include <errno.h>
 
+struct uv__mmsghdr {
+  struct msghdr msg_hdr;
+  unsigned int msg_len;
+};
+
+#if defined(__has_feature)
+# if __has_feature(memory_sanitizer)
+#  define MSAN_ACTIVE 1
+#  include <sanitizer/msan_interface.h>
+# endif
+#endif
+
+#ifdef MSAN_ACTIVE
+void __msan_unpoison(const volatile void *a, size_t size);
+static inline void msan_unpoison(const volatile void *a, size_t size) {
+  __msan_unpoison(a, size);
+}
+void unpoison_recvmmsg(struct uv__mmsghdr *mmsg, unsigned int nmsgs){
+  unsigned int i;
+  for (i = 0; i < nmsgs; ++i) {
+    msan_unpoison(&mmsg[i].msg_len, sizeof(mmsg[i].msg_len));
+    unsigned int maxlen = mmsg[i].msg_len;
+    struct msghdr *msg = &mmsg[i].msg_hdr;
+    msan_unpoison(msg,sizeof(struct msghdr));
+    if (msg->msg_name && msg->msg_namelen)
+      msan_unpoison(msg->msg_name, msg->msg_namelen);
+    if (msg->msg_iov && msg->msg_iovlen)
+      msan_unpoison(msg->msg_iov,sizeof(*msg->msg_iov) * msg->msg_iovlen);
+    size_t j;
+    for (j = 0; j < nmsgs && maxlen; ++j){
+      msan_unpoison(&msg->msg_iov[j],sizeof(struct iovec));
+      size_t iolen = msg->msg_iov[j].iov_len;
+      size_t sz = (iolen < maxlen) ? iolen : maxlen;
+      msan_unpoison(msg->msg_iov[j].iov_base, sz);
+      maxlen -= sz;
+    }
+    if (msg->msg_control && msg->msg_controllen)
+      msan_unpoison(msg->msg_control, msg->msg_controllen);
+  }
+}
+#else
+static inline void msan_unpoison(const volatile void *a, size_t size) {}
+void unpoison_recvmmsg(struct uv__mmsghdr *mmsg, unsigned int nmsgs) {}
+#endif // MSAN_ACTIVE
+
 #if defined(__arm__)
 # if defined(__thumb__) || defined(__ARM_EABI__)
 #  define UV_SYSCALL_BASE 0
@@ -140,7 +185,6 @@
 # endif
 #endif /* __NR_getrandom */
 
-struct uv__mmsghdr;
 
 int uv__sendmmsg(int fd, struct uv__mmsghdr* mmsg, unsigned int vlen) {
 #if defined(__i386__)
@@ -186,7 +230,11 @@ int uv__recvmmsg(int fd, struct uv__mmsghdr* mmsg, unsigned int vlen) {
 
   return rc;
 #elif defined(__NR_recvmmsg)
-  return syscall(__NR_recvmmsg, fd, mmsg, vlen, /* flags */ 0, /* timeout */ 0);
+  int result;
+  result = syscall(__NR_recvmmsg, fd, mmsg, vlen, /* flags */ 0, /* timeout */ 0);
+  if (result>0)
+    unpoison_recvmmsg(mmsg, result);
+  return result;
 #else
   return errno = ENOSYS, -1;
 #endif
@@ -250,7 +298,11 @@ int uv__statx(int dirfd,
 #if !defined(__NR_statx) || defined(__ANDROID_API__) && __ANDROID_API__ < 30
   return errno = ENOSYS, -1;
 #else
-  return syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
+  int result;
+  result = syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
+  if (!result)
+    msan_unpoison(statxbuf, sizeof(struct uv__statx));
+  return result;
 #endif
 }
 
